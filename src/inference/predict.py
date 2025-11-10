@@ -41,10 +41,13 @@ def run(cfg_path):
     price_te  = elms["elm_price"].predict(torch.from_numpy(Xte_price)).numpy()
 
     # save predictions flat
+    # Columns are expected as interleaved per-horizon: wind_mw+h1, solar_mw+h1, load_mw+h1, price+h1, wind_mw+h2, ...
     cols = []
     for h in range(hz):
         cols += [f"wind_mw+h{h+1}", f"solar_mw+h{h+1}", f"load_mw+h{h+1}", f"price+h{h+1}"]
-    arr = np.concatenate([wind_mw_te, solar_mw_te, load_te, price_te], axis=1).reshape(Zte.shape[0], -1)
+    # build interleaved array so column names match values: for each horizon take the 4 target columns
+    blocks = [np.column_stack([wind_mw_te[:, h], solar_mw_te[:, h], load_te[:, h], price_te[:, h]]) for h in range(hz)]
+    arr = np.concatenate(blocks, axis=1)  # shape [N, hz*4]
     pred_df = pd.DataFrame(arr, index=te_index, columns=cols)
     out = Path(cfg["paths"]["outputs_dir"])/"predictions"/"test_predictions.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
