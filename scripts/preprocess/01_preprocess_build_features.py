@@ -45,13 +45,24 @@ def safe_cf(mw: pd.Series, cap: pd.Series, proxy: pd.Series | None = None) -> pd
 
 def first_existing(df, *cands):
     for c in cands:
-        if c in df.columns: return c
+        if c in df.columns:
+            return c
     raise KeyError(f"None of the columns exist: {cands}")
 
 # ---------- load raw ----------
-raw = pd.read_csv(RAW_CSV, parse_dates=["Time (UTC)"]).sort_values("Time (UTC)")
+def read_csv_try_enc(path, **kwargs):
+    # Try common encodings when reading CSVs that may contain special characters
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(path, encoding=enc, **kwargs)
+        except UnicodeDecodeError:
+            continue
+    # last resort: let pandas decide / raise the original error
+    return pd.read_csv(path, **kwargs)
+
+raw = read_csv_try_enc(RAW_CSV, parse_dates=["Time (UTC)"]).sort_values("Time (UTC)")
 raw["Time (UTC)"] = pd.to_datetime(raw["Time (UTC)"], utc=True)
-raw = raw.set_index("Time (UTC)").asfreq("H")
+raw = raw.set_index("Time (UTC)").asfreq("h")
 
 # normalize odd encodings once (keep both if present)
 rename_map = {
@@ -64,7 +75,7 @@ rename_map = {
   "precipitation (mm)": "precipitation_mm",
   "DA_Price_EUR_MWh": "Price_EUR_MWh",
 }
-raw = raw.rename(columns={k:v for k,v in rename_map.items() if k in raw.columns})
+raw = raw.rename(columns={k: v for k, v in rename_map.items() if k in raw.columns})
 
 # Mandatory base columns (support legacy names too)
 PRICE = first_existing(raw, "Price_EUR_MWh", "DA_Price_EUR_MWh")
@@ -73,33 +84,52 @@ SOLAR = first_existing(raw, "Solar_MW")
 LOAD  = first_existing(raw, "Actual_Load_MW")
 
 # ---------- derived met & proxies ----------
-# choose temp/pressure/wind columns (works whether you renamed or not)
-T_C   = raw.get("temperature_2m_C",   raw.get("temperature_2m (°C)"))
-p_hPa = raw.get("surface_pressure_hPa", raw.get("surface_pressure (hPa)"))
+# choose temp/pressure/humidity/wind columns (works whether you renamed or not)
+T_C   = raw.get("temperature_2m_C",      raw.get("temperature_2m (°C)"))
+p_hPa = raw.get("surface_pressure_hPa",  raw.get("surface_pressure (hPa)"))
 RHpct = raw.get("relative_humidity_2m_pct", raw.get("relative_humidity_2m (%)"))
-v10   = raw.get("wind_speed_10m_ms",  raw.get("wind_speed_10m (m/s)"))
+
+# wind at 100m preferred; fall back to 10m + power law if 100m not present
+v100_raw = raw.get("wind_speed_100m_ms", raw.get("wind_speed_100m (m/s)"))
+v10_raw  = raw.get("wind_speed_10m_ms",  raw.get("wind_speed_10m (m/s)"))
+
 sw    = raw.get("shortwave_radiation_Wm2", raw.get("shortwave_radiation (W/mÂ²)"))
 
 # guard against missing weather columns
-T_C = pd.to_numeric(T_C, errors="coerce").fillna(method="ffill") if T_C is not None else pd.Series(15.0, index=raw.index)
-p_Pa = pd.to_numeric(p_hPa, errors="coerce").fillna(method="ffill").astype(float)*100 if p_hPa is not None else pd.Series(1013.25*100, index=raw.index)
-RH = (pd.to_numeric(RHpct, errors="coerce").clip(0,100)/100.0) if RHpct is not None else pd.Series(0.6, index=raw.index)
-v10 = pd.to_numeric(v10, errors="coerce").clip(lower=0) if v10 is not None else pd.Series(3.0, index=raw.index)
-T_K = T_C + 273.15
-e_s = 610.94 * np.exp((17.625*T_C)/(T_C+243.04))
-e   = RH * e_s
-q   = 0.622 * e / (p_Pa - (1-0.622)*e).clip(lower=1.0)
-rho_air = p_Pa / (287.05 * (T_K*(1+0.61*q)))
-raw["air_density_kgm3"] = rho_air
+T_C = pd.to_numeric(T_C, errors="coerce").ffill() if T_C is not None else pd.Series(15.0, index=raw.index)
+p_Pa = pd.to_numeric(p_hPa, errors="coerce").ffill().astype(float)*100 if p_hPa is not None else pd.Series(1013.25*100, index=raw.index)
+RH = (pd.to_numeric(RHpct, errors="coerce").clip(0, 100) / 100.0) if RHpct is not None else pd.Series(0.6, index=raw.index)
 
-v100 = v10 * (100/10)**0.143
+# wind @100m: use provided 100m, else compute from 10m, else fallback constant
+if v100_raw is not None:
+    v100 = pd.to_numeric(v100_raw, errors="coerce").clip(lower=0)
+elif v10_raw is not None:
+    v10 = pd.to_numeric(v10_raw, errors="coerce").clip(lower=0)
+    v100 = v10 * (100 / 10) ** 0.143
+else:
+    # worst case: no wind speed at all in file
+    v100 = pd.Series(3.0, index=raw.index)
+
+T_K = T_C + 273.15
+e_s = 610.94 * np.exp((17.625 * T_C) / (T_C + 243.04))
+e   = RH * e_s
+q   = 0.622 * e / (p_Pa - (1 - 0.622) * e).clip(lower=1.0)
+
+rho_air = p_Pa / (287.05 * (T_K * (1 + 0.61 * q)))
+raw["air_density_kgm3"] = rho_air
 raw["wind_speed_100m_ms"] = v100
 
 if sw is None:
     sw = pd.Series(0.0, index=raw.index)
-raw["pv_proxy"] = (pd.to_numeric(sw, errors="coerce").clip(lower=0) *
-                   (1.0 - 0.005*(T_C-25).clip(lower=0))).clip(lower=0)
-raw["wind_power_proxy"] = (raw["air_density_kgm3"]*(v100**3)).clip(upper=np.nanpercentile((rho_air*(v100**3)).fillna(0), 99))
+
+raw["pv_proxy"] = (
+    pd.to_numeric(sw, errors="coerce").clip(lower=0)
+    * (1.0 - 0.005 * (T_C - 25).clip(lower=0))
+).clip(lower=0)
+
+raw["wind_power_proxy"] = (
+    raw["air_density_kgm3"] * (v100 ** 3)
+).clip(upper=np.nanpercentile((rho_air * (v100 ** 3)).fillna(0), 99))
 
 # ---------- holidays ----------
 if Path(HOL_CSV).exists():
@@ -108,8 +138,9 @@ if Path(HOL_CSV).exists():
     raw["is_public_holiday"] = raw.index.floor("D").isin(hol["date"]).astype(int)
 else:
     raw["is_public_holiday"] = 0
+
 raw["is_weekend"] = (raw.index.dayofweek >= 5).astype(int)
-raw["is_special_day"] = ((raw["is_public_holiday"]==1) | (raw["is_weekend"]==1)).astype(int)
+raw["is_special_day"] = ((raw["is_public_holiday"] == 1) | (raw["is_weekend"] == 1)).astype(int)
 
 # ---------- annual capacity -> hourly ----------
 cap = pd.read_csv(CAP_CSV)
@@ -135,13 +166,22 @@ df["CF_Wind"]  = safe_cf(df[WIND],  df["Wind_Cap_MW"],  proxy=df["wind_power_pro
 
 # ---------- calendar sines/cosines ----------
 idx = df.index
-df["hour_sin"]  = np.sin(2*np.pi*idx.hour/24);  df["hour_cos"]  = np.cos(2*np.pi*idx.hour/24)
-df["dow_sin"]   = np.sin(2*np.pi*idx.dayofweek/7); df["dow_cos"] = np.cos(2*np.pi*idx.dayofweek/7)
-df["month_sin"] = np.sin(2*np.pi*(idx.month-1)/12); df["month_cos"] = np.cos(2*np.pi*(idx.month-1)/12)
+df["hour_sin"]  = np.sin(2 * np.pi * idx.hour / 24)
+df["hour_cos"]  = np.cos(2 * np.pi * idx.hour / 24)
+df["dow_sin"]   = np.sin(2 * np.pi * idx.dayofweek / 7)
+df["dow_cos"]   = np.cos(2 * np.pi * idx.dayofweek / 7)
+df["month_sin"] = np.sin(2 * np.pi * (idx.month - 1) / 12)
+df["month_cos"] = np.cos(2 * np.pi * (idx.month - 1) / 12)
 
 # ---------- save ----------
-df_out = df.reset_index().rename(columns={"index":"Time (UTC)", "wind_speed_100m_ms":"wind_speed_100m (m/s)"})
+df_out = df.reset_index().rename(
+    columns={
+        "index": "Time (UTC)",
+        "wind_speed_100m_ms": "wind_speed_100m (m/s)",
+    }
+)
 df_out.to_csv(OUT_CSV, index=False)
 if OUT_FULL:
     df_out.to_csv(OUT_FULL, index=False)
+
 print(f"Saved engineered CSV to {OUT_CSV}" + (f" and {OUT_FULL}" if OUT_FULL else ""))
