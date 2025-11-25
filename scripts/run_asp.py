@@ -129,7 +129,7 @@ def run(cfg_path):
         [
             "clingo",
             "src/asp/core_asp.lp",
-            "src/asp/weather_asp.lp",
+            #"src/asp/weather_asp.lp",
             "src/asp/market_asp.lp",
             str(facts_path),
             "--opt-mode=opt",
@@ -144,37 +144,34 @@ def run(cfg_path):
         print(f"clingo exited with code {result.returncode}")
         print(f"STDERR:\n{result.stderr}")
         print(f"STDOUT:\n{result.stdout}")
-        if result.returncode == 65:
-            print("(Exit code 65 usually means UNSATISFIABLE: the ASP constraints cannot be satisfied)")
-            print("Falling back to Python ASP rules...")
-            # Use Python fallback
-            preds_reset = preds.reset_index(drop=True)
-            preds_with_caps = preds.copy()
-            preds_with_caps["cap_wind_mw"] = caps["cap_wind_mw"].values
-            preds_with_caps["cap_solar_mw"] = caps["cap_solar_mw"].values
+        print("Non-zero exit from clingo -> falling back to Python ASP rules...")
 
-            
-            wind_cols = [c for c in preds_with_caps.columns if c.startswith("wind_mw+h")]
-            solar_cols = [c for c in preds_with_caps.columns if c.startswith("solar_mw+h")]
-            load_cols = [c for c in preds_with_caps.columns if c.startswith("load_mw+h")]
-            price_cols = [c for c in preds_with_caps.columns if c.startswith("price+h")]
-            
-            cleaned, flags = apply_asp_bounds(
-                preds_with_caps,
-                wind_cols=wind_cols,
-                solar_cols=solar_cols,
-                load_cols=load_cols,
-                price_cols=price_cols,
-                pv_night_hours=tuple(cfg["asp"]["pv_night_hours"]),
-                ramp_limits=None,
-            )
-            out_p = Path(cfg["paths"]["outputs_dir"]) / "predictions" / "test_predictions_asp.parquet"
-            out_p.parent.mkdir(parents=True, exist_ok=True)
-            cleaned.set_index(preds.index, inplace=True)
-            cleaned = cleaned.drop(columns=["cap_wind_mw", "cap_solar_mw"], errors="ignore")
-            cleaned.to_parquet(out_p)
-            print(f"Python ASP applied; saved {out_p}, num adjusted rows={flags['adjusted'].sum()}")
-            return
+        preds_with_caps = preds.copy()
+        preds_with_caps["cap_wind_mw"] = caps["cap_wind_mw"].values
+        preds_with_caps["cap_solar_mw"] = caps["cap_solar_mw"].values
+
+        wind_cols  = [c for c in preds_with_caps.columns if c.startswith("wind_mw+h")]
+        solar_cols = [c for c in preds_with_caps.columns if c.startswith("solar_mw+h")]
+        load_cols  = [c for c in preds_with_caps.columns if c.startswith("load_mw+h")]
+        price_cols = [c for c in preds_with_caps.columns if c.startswith("price+h")]
+
+        cleaned, flags = apply_asp_bounds(
+            preds_with_caps,
+            wind_cols=wind_cols,
+            solar_cols=solar_cols,
+            load_cols=load_cols,
+            price_cols=price_cols,
+            pv_night_hours=tuple(cfg["asp"]["pv_night_hours"]),
+            ramp_limits=None,
+        )
+
+        out_p = Path(cfg["paths"]["outputs_dir"]) / "predictions" / "test_predictions_asp.parquet"
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        cleaned = cleaned.drop(columns=["cap_wind_mw", "cap_solar_mw"], errors="ignore")
+        cleaned.to_parquet(out_p)
+        print(f"Python ASP applied; saved {out_p}, num adjusted rows={flags['adjusted'].sum()}")
+        return
+
 
     repairs = parse_repairs(result.stdout)
 
