@@ -8,9 +8,10 @@
 
 # Data & outputs
 #data/interim/
-#data/processed/
+data/processed/
 #outputs/
 #checkpoints/
+data/raw/
 
 # OS/Editor
 .DS_Store
